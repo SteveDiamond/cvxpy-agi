@@ -23,32 +23,57 @@ jobs:
           enable-cache: false
       - name: CPU features
         run: lscpu
-      - name: Install the optional solver suite
-        run: uv sync --all-extras --no-extra uno --dev
-      - name: Compare full and isolated test processes
+      - name: Install two vendor solvers
+        run: uv sync --extra copt --extra gurobi --extra testing
+      - name: Compare sequential solves and environment changes
+        shell: bash
         run: |
-          set +e
           ulimit -c 0
-          run_case() {
-            label=$1
-            shift
-            "$@" > "$RUNNER_TEMP/pytest.log" 2>&1
-            status=$?
-            echo "$label exit=$status"
-            if [[ $status == 132 ]]; then
-              grep -m 1 -F 'Illegal instruction' "$RUNNER_TEMP/pytest.log"
-            else
-              tail -n 2 "$RUNNER_TEMP/pytest.log"
-            fi
-          }
-          conic=cvxpy/tests/test_conic_solvers.py
-          qp=cvxpy/tests/test_qp_solvers.py
-          for suite in "$conic" "$qp"; do
-            run_case "full $suite" .venv/bin/pytest -q -m 'not knitro and not ortools' "$suite"
-            run_case "AVX2 $suite" env MKL_ENABLE_INSTRUCTIONS=AVX2 .venv/bin/pytest -q -m 'not knitro and not ortools' "$suite"
-            run_case "COPT only $suite" .venv/bin/pytest -q -k copt "$suite"
-            run_case "without COPT $suite" .venv/bin/pytest -q -m 'not knitro and not ortools' -k 'not copt' "$suite"
+          cat > "$RUNNER_TEMP/solve.py" <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          import cvxpy as cp
+          from cvxpy.tests.solver_test_helpers import StandardTestMixedCPs
+
+          def flags():
+              return {key: val for line in subprocess.check_output(["env"], text=True).splitlines()
+                      if "=" in line for key, val in [line.split("=", 1)]
+                      if key.startswith(("MKL_", "KMP_", "OMP_", "INTEL_"))}
+
+          def copt():
+              StandardTestMixedCPs.test_exp_soc_1(solver="COPT", FeasTol=1e-9, DualTol=1e-9)
+
+          print("Initial native environment", flags(), flush=True)
+          for action in sys.argv[1:]:
+              print("Running", action, flush=True)
+              if action == "gurobi-import":
+                  import gurobipy
+              elif action == "gurobi-env":
+                  import gurobipy
+                  with gurobipy.Env() as e:
+                      pass
+              elif action == "gurobi-solve":
+                  x = cp.Variable()
+                  cp.Problem(cp.Minimize(x), [x >= 1]).solve(solver=cp.GUROBI)
+              elif action == "copt-import":
+                  import coptpy
+              elif action == "copt":
+                  copt()
+              print("Native environment", flags(), flush=True)
+          PY
+          for actions in 'copt' 'gurobi-import copt' 'gurobi-env copt' 'gurobi-solve copt' 'copt-import gurobi-solve copt' 'copt gurobi-solve copt'; do
+            result=0
+            .venv/bin/python "$RUNNER_TEMP/solve.py" $actions > "$RUNNER_TEMP/out" 2>&1 || result=$?
+            echo "$actions exit=$result"
+            grep -e '^Running' -e '^Native environment' "$RUNNER_TEMP/out" || true
           done
-          for other in scs xpress mosek gurobi cvxopt scip highs moreau; do
-            run_case "COPT and $other" .venv/bin/pytest -q -k "copt or $other" "$conic"
-          done
+      - name: Check separate solver environments
+        run: |
+          uv sync --all-extras --no-extra uno --no-extra copt --dev
+          uv run pytest -q -rs -m 'not knitro and not ortools' cvxpy/tests/test_conic_solvers.py
+          uv run pytest -q -rs -m 'not knitro' cvxpy/tests/test_qp_solvers.py
+          uv run --isolated --extra testing --extra copt pytest -q -rs \
+            -k 'copt or test_installed_solvers' cvxpy/tests/test_conic_solvers.py \
+            cvxpy/tests/test_qp_solvers.py cvxpy/tests/test_copt_write.py
