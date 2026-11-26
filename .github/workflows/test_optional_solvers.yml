@@ -63,17 +63,18 @@ jobs:
                   copt()
               print("Native environment", flags(), flush=True)
           PY
-          for actions in 'copt' 'gurobi-import copt' 'gurobi-env copt' 'gurobi-solve copt' 'copt-import gurobi-solve copt' 'copt gurobi-solve copt'; do
+          for config in default GRB_BLAS_WORKAROUND_SKIP=1 MKL_DEBUG_CPU_TYPE= MKL_DEBUG_CPU_TYPE=5; do
+            args=()
+            if [[ "$config" != default ]]; then args+=("$config"); fi
             result=0
-            .venv/bin/python "$RUNNER_TEMP/solve.py" $actions > "$RUNNER_TEMP/out" 2>&1 || result=$?
-            echo "$actions exit=$result"
+            env "${args[@]}" .venv/bin/python "$RUNNER_TEMP/solve.py" gurobi-solve copt > "$RUNNER_TEMP/out" 2>&1 || result=$?
+            echo "$config exit=$result"
             grep -e '^Running' -e '^Native environment' "$RUNNER_TEMP/out" || true
           done
-      - name: Check separate solver environments
+      - name: Exercise both full suites with the Gurobi workaround disabled
+        env:
+          GRB_BLAS_WORKAROUND_SKIP: '1'
         run: |
-          uv sync --all-extras --no-extra uno --no-extra copt --dev
+          uv sync --all-extras --no-extra uno --dev
           uv run pytest -q -rs -m 'not knitro and not ortools' cvxpy/tests/test_conic_solvers.py
           uv run pytest -q -rs -m 'not knitro' cvxpy/tests/test_qp_solvers.py
-          uv run --isolated --extra testing --extra copt pytest -q -rs \
-            -k 'copt or test_installed_solvers' cvxpy/tests/test_conic_solvers.py \
-            cvxpy/tests/test_qp_solvers.py cvxpy/tests/test_copt_write.py
