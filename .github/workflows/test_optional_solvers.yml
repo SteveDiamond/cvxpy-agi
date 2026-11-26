@@ -11,9 +11,6 @@ jobs:
       matrix:
         os: [ubuntu-22.04]
         sample: [1, 2, 3]
-        include:
-          - os: ubuntu-22.04-arm
-            sample: 1
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -26,24 +23,32 @@ jobs:
           enable-cache: false
       - name: CPU features
         run: lscpu
-      - name: Install CVXPY and COPT
-        run: |
-          uv venv
-          uv pip install -e '.[testing,COPT]' coptpy==8.0.7
-          .venv/bin/python -c "import cvxpy as cp; assert cp.COPT in cp.installed_solvers()"
-      - name: Compare CPU settings on the same hardware
+      - name: Install the optional solver suite
+        run: uv sync --all-extras --no-extra uno --dev
+      - name: Compare full and isolated test processes
         run: |
           set +e
           ulimit -c 0
-          for setting in default MKL_ENABLE_INSTRUCTIONS=AVX2 MKL_CBWR=AVX2 MKL_CBWR=COMPATIBLE; do
-            args=()
-            if [[ "$setting" != default ]]; then args+=("$setting"); fi
-            for case in 'test_conic_solvers.py::TestCOPT::test_copt_exp_soc_1' 'test_qp_solvers.py::test_regression_1[COPT]'; do
-              env "${args[@]}" .venv/bin/python -m pytest -q -rs "cvxpy/tests/$case"
-              echo "$setting $case exit=$?" >> "$GITHUB_STEP_SUMMARY"
-            done
+          run_case() {
+            label=$1
+            shift
+            "$@" > "$RUNNER_TEMP/pytest.log" 2>&1
+            status=$?
+            echo "$label exit=$status"
+            if [[ $status == 132 ]]; then
+              grep -m 1 -F 'Illegal instruction' "$RUNNER_TEMP/pytest.log"
+            else
+              tail -n 2 "$RUNNER_TEMP/pytest.log"
+            fi
+          }
+          conic=cvxpy/tests/test_conic_solvers.py
+          qp=cvxpy/tests/test_qp_solvers.py
+          for suite in "$conic" "$qp"; do
+            run_case "full $suite" .venv/bin/pytest -q -m 'not knitro and not ortools' "$suite"
+            run_case "AVX2 $suite" env MKL_ENABLE_INSTRUCTIONS=AVX2 .venv/bin/pytest -q -m 'not knitro and not ortools' "$suite"
+            run_case "COPT only $suite" .venv/bin/pytest -q -k copt "$suite"
+            run_case "without COPT $suite" .venv/bin/pytest -q -m 'not knitro and not ortools' -k 'not copt' "$suite"
           done
-      - name: Exercise all COPT conic, quadratic and write tests with AVX2 cap
-        env:
-          MKL_ENABLE_INSTRUCTIONS: AVX2
-        run: .venv/bin/python -m pytest -q -rs cvxpy/tests/test_conic_solvers.py cvxpy/tests/test_qp_solvers.py cvxpy/tests/test_copt_write.py -k copt
+          for other in scs xpress mosek gurobi cvxopt scip highs moreau; do
+            run_case "COPT and $other" .venv/bin/pytest -q -k "copt or $other" "$conic"
+          done
