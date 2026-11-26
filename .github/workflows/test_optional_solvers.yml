@@ -1,84 +1,49 @@
-name: test_optional_solvers
-
+name: COPT CPU dispatch comparison
 on:
-  pull_request:
   push:
-    branches:
-      - master
-    tags:
-      - '*'
-
+    branches: [codex/copt-dispatch-check]
+permissions:
+  contents: read
 jobs:
-  test_optional_solvers:
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash -l {0}
+  solve:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-22.04, macos-26 ]  # Windows excluded - cylp/CBC cannot be built
+        os: [ubuntu-22.04]
+        sample: [1, 2, 3]
+        include:
+          - os: ubuntu-22.04-arm
+            sample: 1
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # setuptools-scm needs tags to compute the version
-      - name: Set Additional Envs
-        run: |
-          echo "PYTHON_SUBVERSION=$(echo $PYTHON_VERSION | cut -c 3-)" >> $GITHUB_ENV
-          echo $MOSEK_CI_BASE64 | base64 -d > mosek.lic
-          echo "MOSEKLM_LICENSE_FILE=$( [[ $RUNNER_OS == 'macOS' ]] && echo $(pwd)/mosek.lic || echo $(realpath mosek.lic) )" >> $GITHUB_ENV
-          echo $KNITRO_LICENSE > ~/artelys_lic.txt
-          # is_knitro_available() gates on ARTELYS_LICENSE; only set it
-          # when a license secret is present so forks skip KNITRO tests.
-          if [ -n "$KNITRO_LICENSE" ]; then echo "ARTELYS_LICENSE=$HOME" >> $GITHUB_ENV; fi
-
+          fetch-depth: 0
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
-          python-version: 3.12
-          enable-cache: true
-      - name: Setup Julia
-        uses: julia-actions/setup-julia@v3
-        with:
-          version: 'lts'
-      - name: Install COSMO
-        run: julia -e 'using Pkg; Pkg.add("COSMO")'
-      - name: Install SuiteSparse (macOS)
-        if: runner.os == 'macOS'
-        run: brew install suite-sparse
-      # Uno (unopy) is exercised by test_nlp_solvers, which installs it on its
-      # own with the IPOPT/OpenMP toolchain it needs. The conic and QP tests
-      # run here don't use it, so skip the extra to avoid a from-source build.
-      - name: Install cvxpy dependencies and all optional solvers
-        run: uv sync --all-extras --no-extra uno --dev
-      - name: Print installed solvers
-        run: uv run python -c "import cvxpy; print(cvxpy.installed_solvers())"
-      # KNITRO bundles LLVM libomp; CVXOPT bundles GNU libgomp via its
-      # OpenBLAS dependency. Loading both in one process can crash inside
-      # KNITRO's KN_solve on macOS, so run KNITRO tests in a separate
-      # process (mirrors test_nlp_solvers.yml).
-      #
-      # OR-Tools >= 9.14 bundles its own HiGHS inside libortools.so.
-      # Loading highspy and ortools in the same process causes native
-      # symbol conflicts (google/or-tools#5246). Run OR-Tools tests
-      # (GLOP/PDLP) in a separate process to avoid this.
-      - name: Run test_conic_solvers
-        run: uv run pytest -rs -m "not knitro and not ortools" cvxpy/tests/test_conic_solvers.py
-      - name: Run test_conic_solvers (OR-Tools)
-        if: always()
-        run: uv run pytest -rs -m ortools cvxpy/tests/test_conic_solvers.py
-      - name: Run test_conic_solvers (KNITRO)
-        if: always()
-        run: uv run pytest -rs -m knitro cvxpy/tests/test_conic_solvers.py
-      - name: Run test_qp_solvers
-        if: always()
-        run: uv run pytest -rs -m "not knitro" cvxpy/tests/test_qp_solvers.py
-      - name: Run test_qp_solvers (KNITRO)
-        if: always()
-        run: uv run pytest -rs -m knitro cvxpy/tests/test_qp_solvers.py
-
-    env:
-      RUNNER_OS: ${{ matrix.os }}
-      PYTHON_VERSION: 3.12
-      MOSEK_CI_BASE64: ${{ secrets.MOSEK_CI_BASE64 }}
-      KNITRO_LICENSE: ${{ secrets.KNITRO_LICENSE }}
-      MOREAU_LICENSE_KEY: ${{ secrets.MOREAU_KEY }}
+          python-version: '3.12'
+          enable-cache: false
+      - name: CPU features
+        run: lscpu
+      - name: Install CVXPY and COPT
+        run: |
+          uv venv
+          uv pip install -e '.[testing,COPT]' coptpy==8.0.7
+          .venv/bin/python -c "import cvxpy as cp; assert cp.COPT in cp.installed_solvers()"
+      - name: Compare CPU settings on the same hardware
+        run: |
+          set +e
+          ulimit -c 0
+          for setting in default MKL_ENABLE_INSTRUCTIONS=AVX2 MKL_CBWR=AVX2 MKL_CBWR=COMPATIBLE; do
+            args=()
+            if [[ "$setting" != default ]]; then args+=("$setting"); fi
+            for case in 'test_conic_solvers.py::TestCOPT::test_copt_exp_soc_1' 'test_qp_solvers.py::test_regression_1[COPT]'; do
+              env "${args[@]}" .venv/bin/python -m pytest -q -rs "cvxpy/tests/$case"
+              echo "$setting $case exit=$?" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+      - name: Exercise all COPT conic, quadratic and write tests with AVX2 cap
+        env:
+          MKL_ENABLE_INSTRUCTIONS: AVX2
+        run: .venv/bin/python -m pytest -q -rs cvxpy/tests/test_conic_solvers.py cvxpy/tests/test_qp_solvers.py cvxpy/tests/test_copt_write.py -k copt
